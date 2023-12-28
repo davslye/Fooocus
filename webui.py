@@ -16,12 +16,25 @@ import modules.style_sorter as style_sorter
 import modules.meta_parser
 import args_manager
 import copy
+import struct
 
 from modules.sdxl_styles import legal_style_names
 from modules.private_logger import get_current_html_path
 from modules.ui_gradio_extensions import reload_javascript
 from modules.auth import auth_enabled, check_auth
 
+model_selected = ''
+base_model_hints = []
+refiner_model_hints = []
+global_lora_hints = {}
+
+class ModelPromptHints(object):
+    instructions = ''
+    list_of_prompt_hints = [['']]
+
+    def __init__(self, instruction, list_of_prompt_hints):
+        self.instructions = instruction
+        self.list_of_prompt_hints = list_of_prompt_hints
 
 def generate_clicked(*args):
     import ldm_patched.modules.model_management as model_management
@@ -75,6 +88,111 @@ def generate_clicked(*args):
     print(f'Total time: {execution_time:.2f} seconds')
     return
 
+## Extracts the tag frequency from the LORA to add prompt hints
+def get_lora_hints(lora, lora_slot_index):
+    global global_lora_hints
+
+    model_hints = []
+    print(f'reading lora metadata: {lora} for slot index {lora_slot_index}')
+    file_path_for_hints = os.path.realpath(os.path.join('.', 'models', 'loras', lora))
+    tag_frequency = ''
+    try:
+        with open(file = file_path_for_hints, mode = "rb") as f: 
+            length_of_header = struct.unpack('<Q', f.read(8))[0]
+            header_data = f.read(length_of_header)
+            header = json.loads(header_data)
+
+            # use the list of header keys to form hints
+            tag_frequency = header['__metadata__']['ss_tag_frequency']
+
+            parsed_tags = tag_frequency.replace('\\\"','"')
+            parsed_tags = json.loads(parsed_tags)
+            first_key = (list(parsed_tags.keys()) or [])[0]
+            tags_listed = list(parsed_tags[first_key])
+            # turn each key into its own selectable hint for the prompt
+            hints_from_lora_meta = list(map(lambda line: [line.strip()], tags_listed))
+            global_lora_hints[lora_slot_index] = hints_from_lora_meta
+            model_hints = ModelPromptHints(f'### No usage instructions from LORA {lora}', hints_from_lora_meta)
+
+    except Exception as e:
+        print(f'failed because {e}')
+        failed_to_read =  ModelPromptHints( 
+            instruction = f'No hints found for "{lora} when looking for "{file_path_for_hints}"', 
+            list_of_prompt_hints= [['']] 
+        )
+        model_hints = failed_to_read
+
+    return model_hints
+
+def click_lora_1_hint(element_index, prompt_text, slot_index):
+    global global_lora_hints
+    
+    # get the global lora prompt option
+    lora_values = global_lora_hints[slot_index] if slot_index in global_lora_hints else [[""]]
+    
+    # Get the flattened list of hints, and the index
+    hint = sum(lora_values, [])[element_index]
+    prompt_plus = add_hint_to_prompt(hint, prompt_text or '')
+    return prompt_plus
+
+def getModelPromptHints(model_name):
+    pruned_model_name = model_name.split('.')[-2]
+    file_path_for_hints = os.path.realpath(os.path.join('.', 'models', 'checkpoints', pruned_model_name + '_hints.txt'))
+    try: 
+        with open(file= file_path_for_hints, mode ='r') as baseModelHints:
+            listOfTextHints = baseModelHints.readlines()
+
+            # omit usage instructions from hints, which start with ##
+            usage_instruction = '\n'.join(list(filter(lambda line: line.startswith('#') , listOfTextHints)))
+
+            # drop instructions / whitespace row from being considered hints
+            hints = list(filter(lambda line: (not line.startswith('##')) and (not (line.strip() == '')), listOfTextHints))
+            # drop new lines / whitespace of each hint
+            # # # expect only one hint per line
+            listOfTextHints = list(map(lambda s: [s.strip()], hints))
+            return ModelPromptHints(usage_instruction, listOfTextHints)
+    except:
+        failed_to_read =  ModelPromptHints( 
+            instruction = f'No hints found for "{pruned_model_name} when looking for "{file_path_for_hints}"', 
+            list_of_prompt_hints= [['']] 
+        )
+        return failed_to_read
+
+def handle_refined_model_change(refiner_model):
+    model_hints = getModelPromptHints(refiner_model)
+    global refiner_model_hints 
+    refiner_model_hints = model_hints.list_of_prompt_hints
+    hint_list_label = f'{refiner_model.split(".")[-2]} Hint List'
+    return [gr.update(visible=refiner_model != 'None'), model_hints.instructions, gr.update(visible=True, samples=model_hints.list_of_prompt_hints, label=hint_list_label)]
+
+def handle_base_model_change(base_model):
+    model_hints = getModelPromptHints(base_model)
+    global base_model_hints 
+    base_model_hints = model_hints.list_of_prompt_hints
+    hint_list_label = f'{base_model.split(".")[-2]} Hint List'
+    return [model_hints.instructions, gr.update(visible=True, samples=model_hints.list_of_prompt_hints, label=hint_list_label)]
+
+def handle_lora_model_change(lora, slot_index):
+    model_hints = get_lora_hints(lora, lora_slot_index= slot_index)
+    global global_lora_hints 
+    global_lora_hints[slot_index] = model_hints.list_of_prompt_hints
+    has_hints = not ((model_hints.list_of_prompt_hints == None) or model_hints.list_of_prompt_hints == [['']])
+    return gr.update(visible= has_hints, samples=model_hints.list_of_prompt_hints)
+
+def click_base_model_hint(element_index, prompt_text):
+    # Get the flattened list of hints, and the index
+    hint = sum(example_base_model_hints, [])[element_index]
+    prompt_plus = add_hint_to_prompt(hint, prompt_text or '')
+    return prompt_plus
+
+def click_refiner_hint(element_index, prompt_text):
+    # Get the flattened list of hints, and the index
+    hint = sum(refiner_model_hints, [])[element_index]
+    prompt_plus = add_hint_to_prompt(hint, prompt_text or '')
+    return prompt_plus
+
+def add_hint_to_prompt(hint, prompt_text):
+    return ', '.join([hint, prompt_text or ''])
 
 reload_javascript()
 
@@ -87,7 +205,7 @@ shared.gradio_root = gr.Blocks(
     title=title,
     css=modules.html.css).queue()
 
-with shared.gradio_root:
+with shared.gradio_root as demo:
     with gr.Row():
         with gr.Column(scale=2):
             with gr.Row():
@@ -130,6 +248,39 @@ with shared.gradio_root:
                     stop_button.click(stop_clicked, outputs=[skip_button, stop_button],
                                       queue=False, show_progress=False, _js='cancelGenerateForever')
                     skip_button.click(skip_clicked, queue=False, show_progress=False)
+
+            # customized - u_sly_dog
+            with gr.Row():
+                with gr.Accordion("Prompt hints from model", open = False):
+                    base_model_hints_usage_text = gr.Markdown('-- no model prompt hints --')
+                    refiner_model_hints_usage_text = gr.Markdown('-- no model prompt hints --')
+                    # prompt hints for base model
+                    example_base_model_hints = gr.Dataset(samples=[['']], label='Base Model Hint List', components=[prompt], visible=False, type='index')
+                    example_base_model_hints.click(click_base_model_hint, inputs=[example_base_model_hints, prompt], outputs=prompt, show_progress=False, queue=False)
+                    # prompt hints for refiner model
+                    example_refiner_hints = gr.Dataset(samples=[['']], label='Refiner Hint List', components=[prompt], visible=False, type='index')
+                    example_refiner_hints.click(click_refiner_hint, inputs=[example_refiner_hints, prompt], outputs=prompt, show_progress=False, queue=False)
+                    with gr.Accordion('LORA 1', open = False):
+                        # Lora 1
+                        lora_1_hints = gr.Dataset(samples=[['']], label='LORA 1 Hint List', components=[prompt], visible=True, type='index')
+                        lora_1_hints.click(click_lora_1_hint, inputs=[lora_1_hints, prompt, gr.Number(value=0, precision=0, visible=False)], outputs=prompt, show_progress=False, queue=False)
+                    with gr.Accordion('LORA 2', open = False):
+                        # Lora 2
+                        lora_2_hints = gr.Dataset(samples=[['']], label='LORA 2 Hint List', components=[prompt], visible=True, type='index')
+                        lora_2_hints.click(click_lora_1_hint, inputs=[lora_2_hints, prompt, gr.Number(value=1, precision=0, visible=False)], outputs=prompt, show_progress=False, queue=False)
+                    with gr.Accordion('LORA 3', open = False):
+                        # Lora 3
+                        lora_3_hints = gr.Dataset(samples=[['']], label='LORA 3 Hint List', components=[prompt], visible=True, type='index')
+                        lora_3_hints.click(click_lora_1_hint, inputs=[lora_3_hints, prompt, gr.Number(value=2, precision=0, visible=False)], outputs=prompt, show_progress=False, queue=False)
+                    with gr.Accordion('LORA 4', open = False):
+                        # Lora 4
+                        lora_4_hints = gr.Dataset(samples=[['']], label='LORA 4 Hint List', components=[prompt], visible=True, type='index')
+                        lora_4_hints.click(click_lora_1_hint, inputs=[lora_4_hints, prompt, gr.Number(value=3, precision=0, visible=False)], outputs=prompt, show_progress=False, queue=False)
+                    with gr.Accordion('LORA 5', open = False):
+                        # Lora 5
+                        lora_5_hints = gr.Dataset(samples=[['']], label='LORA 5 Hint List', components=[prompt], visible=True, type='index')
+                        lora_5_hints.click(click_lora_1_hint, inputs=[lora_5_hints, prompt, gr.Number(value=4, precision=0, visible=False)], outputs=prompt, show_progress=False, queue=False)
+            
             with gr.Row(elem_classes='advanced_check_row'):
                 input_image_checkbox = gr.Checkbox(label='Input Image', value=False, container=False, elem_classes='min_check')
                 advanced_checkbox = gr.Checkbox(label='Advanced', value=modules.config.default_advanced_checkbox, container=False, elem_classes='min_check')
@@ -292,6 +443,7 @@ with shared.gradio_root:
                 with gr.Group():
                     with gr.Row():
                         base_model = gr.Dropdown(label='Base Model (SDXL only)', choices=modules.config.model_filenames, value=modules.config.default_base_model_name, show_label=True)
+                        base_model.change(handle_base_model_change, inputs=base_model, outputs=[base_model_hints_usage_text, example_base_model_hints])
                         refiner_model = gr.Dropdown(label='Refiner (SDXL or SD 1.5)', choices=['None'] + modules.config.model_filenames, value=modules.config.default_refiner_model_name, show_label=True)
 
                     refiner_switch = gr.Slider(label='Refiner Switch At', minimum=0.1, maximum=1.0, step=0.0001,
@@ -302,19 +454,74 @@ with shared.gradio_root:
                                                value=modules.config.default_refiner_switch,
                                                visible=modules.config.default_refiner_model_name != 'None')
 
-                    refiner_model.change(lambda x: gr.update(visible=x != 'None'),
-                                         inputs=refiner_model, outputs=refiner_switch, show_progress=False, queue=False)
+                    refiner_model.change(handle_refined_model_change,
+                                         inputs=refiner_model, outputs=[refiner_switch, refiner_model_hints_usage_text, example_refiner_hints], show_progress=False, queue=False)
 
                 with gr.Group():
                     lora_ctrls = []
-
-                    for i, (n, v) in enumerate(modules.config.default_loras):
-                        with gr.Row():
-                            lora_model = gr.Dropdown(label=f'LoRA {i + 1}',
-                                                     choices=['None'] + modules.config.lora_filenames, value=n)
-                            lora_weight = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=v,
-                                                    elem_classes='lora_weight')
-                            lora_ctrls += [lora_model, lora_weight]
+                    
+                    # since we need LORA references, just make the 5 we use
+                    with gr.Row():
+                        print(f'can find item={modules.config.default_loras[0][0]}')
+                        lora_model_1 = gr.Dropdown(label=f'LoRA {1}',
+                                                    choices=['None'] + modules.config.lora_filenames, value=modules.config.default_loras[0][0])
+                        
+                        lora_model_1.change(handle_lora_model_change, 
+                                            inputs=[lora_model_1, gr.Number(value=0, precision=0, visible=False)],
+                                            outputs=[lora_1_hints],
+                                            show_progress=False, queue=False)
+                        
+                        lora_weight_1 = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=modules.config.default_loras[0][1],
+                                                elem_classes='lora_weight')
+                        lora_ctrls += [lora_model_1, lora_weight_1]
+                    with gr.Row():
+                        lora_model_2 = gr.Dropdown(label=f'LoRA {2}',
+                                                    choices=['None'] + modules.config.lora_filenames, value=modules.config.default_loras[1][0])
+                        
+                        lora_model_2.change(handle_lora_model_change, 
+                                            inputs=[lora_model_2, gr.Number(value=1, precision=0, visible=False)],
+                                            outputs=[lora_2_hints], 
+                                            show_progress=False, queue=False)
+                        
+                        lora_weight_2 = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=modules.config.default_loras[1][1],
+                                                elem_classes='lora_weight')
+                        lora_ctrls += [lora_model_2, lora_weight_2]
+                    with gr.Row():
+                        lora_model_3 = gr.Dropdown(label=f'LoRA {3}',
+                                                    choices=['None'] + modules.config.lora_filenames, value=modules.config.default_loras[2][0])
+                        
+                        lora_model_3.change(handle_lora_model_change, 
+                                            inputs=[lora_model_3, gr.Number(value=2, precision=0, visible=False)],
+                                            outputs=[lora_3_hints], 
+                                            show_progress=False, queue=False)
+                        
+                        lora_weight_3 = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=modules.config.default_loras[2][1],
+                                                elem_classes='lora_weight')
+                        lora_ctrls += [lora_model_3, lora_weight_3]
+                    with gr.Row():
+                        lora_model_4 = gr.Dropdown(label=f'LoRA {4}',
+                                                    choices=['None'] + modules.config.lora_filenames, value=modules.config.default_loras[3][0])
+                        
+                        lora_model_4.change(handle_lora_model_change, 
+                                            inputs=[lora_model_4, gr.Number(value=3, precision=0, visible=False)],
+                                            outputs=[lora_4_hints], 
+                                            show_progress=False, queue=False)
+                        
+                        lora_weight_4 = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=modules.config.default_loras[3][1],
+                                                elem_classes='lora_weight')
+                        lora_ctrls += [lora_model_4, lora_weight_4]
+                    with gr.Row():
+                        lora_model_5 = gr.Dropdown(label=f'LoRA {5}',
+                                                    choices=['None'] + modules.config.lora_filenames, value=modules.config.default_loras[4][0])
+                        
+                        lora_model_5.change(handle_lora_model_change, 
+                                            inputs=[lora_model_5, gr.Number(value=4, precision=0, visible=False)],
+                                            outputs=[lora_5_hints], 
+                                            show_progress=False, queue=False)
+                        
+                        lora_weight_5 = gr.Slider(label='Weight', minimum=-2, maximum=2, step=0.01, value=modules.config.default_loras[4][1],
+                                                elem_classes='lora_weight')
+                        lora_ctrls += [lora_model_5, lora_weight_5]
 
                 with gr.Row():
                     model_refresh = gr.Button(label='Refresh', value='\U0001f504 Refresh All Files', variant='secondary', elem_classes='refresh_button')
@@ -595,5 +802,6 @@ shared.gradio_root.launch(
     server_port=args_manager.args.port,
     share=args_manager.args.share,
     auth=check_auth if args_manager.args.share and auth_enabled else None,
-    blocked_paths=[constants.AUTH_FILENAME]
+    blocked_paths=[constants.AUTH_FILENAME],
+    debug=True
 )
